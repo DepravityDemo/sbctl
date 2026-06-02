@@ -26,6 +26,7 @@ import (
 	authorizationv1 "k8s.io/api/authorization/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	batchv1beta1 "k8s.io/api/batch/v1beta1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -46,6 +47,8 @@ import (
 	apisbatch "k8s.io/kubernetes/pkg/apis/batch"
 	apisbatchv1 "k8s.io/kubernetes/pkg/apis/batch/v1"
 	apisbatchv1beta1 "k8s.io/kubernetes/pkg/apis/batch/v1beta1"
+	apiscoordination "k8s.io/kubernetes/pkg/apis/coordination"
+	apiscoordinationv1 "k8s.io/kubernetes/pkg/apis/coordination/v1"
 	apicore "k8s.io/kubernetes/pkg/apis/core"
 	apicorev1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	networking "k8s.io/kubernetes/pkg/apis/networking"
@@ -525,10 +528,67 @@ func (h handler) getAPIV1NamespaceResources(w http.ResponseWriter, r *http.Reque
 			log.Warn("could not convert to table: ", err)
 		} else {
 			decoded = table
+			if resource == "pods" {
+				decoded = augmentPodTableWithLease(decoded, h.clusterData.ClusterResourcesDir, namespace)
+			}
 		}
 	}
 
 	JSON(w, http.StatusOK, decoded)
+}
+
+// augmentPodTableWithLease appends a "Lease" column to a pod table, showing the
+// name of any Lease whose holderIdentity points at that pod (leader election).
+// The holderIdentity convention is "<pod-name>_<uuid>", so the pod name is the
+// substring before the first underscore.
+func augmentPodTableWithLease(obj runtime.Object, resourceDir, namespace string) runtime.Object {
+	table, ok := obj.(*metav1.Table)
+	if !ok {
+		return obj
+	}
+
+	leaseByPod := map[string]string{}
+	leaseFile := filepath.Join(resourceDir, "leases", fmt.Sprintf("%s.json", namespace))
+	if fileExists(leaseFile) {
+		data, err := os.ReadFile(leaseFile)
+		if err != nil {
+			log.Warn("could not read lease file for pod augmentation: ", err)
+		} else {
+			var leaseList coordinationv1.LeaseList
+			if err := json.Unmarshal(data, &leaseList); err != nil {
+				log.Warn("could not unmarshal lease list for pod augmentation: ", err)
+			} else {
+				for _, lease := range leaseList.Items {
+					if lease.Spec.HolderIdentity == nil {
+						continue
+					}
+					holder := *lease.Spec.HolderIdentity
+					podName := holder
+					if idx := strings.Index(holder, "_"); idx >= 0 {
+						podName = holder[:idx]
+					}
+					leaseByPod[podName] = lease.Name
+				}
+			}
+		}
+	}
+
+	table.ColumnDefinitions = append(table.ColumnDefinitions, metav1.TableColumnDefinition{
+		Name:        "Lease",
+		Type:        "string",
+		Description: "Name of the Lease held by this pod (leader election)",
+	})
+	for i := range table.Rows {
+		podName := ""
+		if len(table.Rows[i].Cells) > 0 {
+			if name, ok := table.Rows[i].Cells[0].(string); ok {
+				podName = name
+			}
+		}
+		table.Rows[i].Cells = append(table.Rows[i].Cells, leaseByPod[podName])
+	}
+
+	return table
 }
 
 func (h handler) getAPIV1NamespaceResource(w http.ResponseWriter, r *http.Request) {
@@ -1790,6 +1850,20 @@ func (h handler) toTable(object runtime.Object, r *http.Request) (runtime.Object
 		err := apicorev1.Convert_v1_ResourceQuota_To_core_ResourceQuota(o, converted, nil)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to convert resourcequota")
+		}
+		object = converted
+	case *coordinationv1.LeaseList:
+		converted := &apiscoordination.LeaseList{}
+		err := apiscoordinationv1.Convert_v1_LeaseList_To_coordination_LeaseList(o, converted, nil)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to convert lease list")
+		}
+		object = converted
+	case *coordinationv1.Lease:
+		converted := &apiscoordination.Lease{}
+		err := apiscoordinationv1.Convert_v1_Lease_To_coordination_Lease(o, converted, nil)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to convert lease")
 		}
 		object = converted
 	}
